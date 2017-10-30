@@ -64,16 +64,20 @@ class CPUSharedStorageManager final : public StorageManager {
    * \brief Default destructor.
    */
   ~CPUSharedStorageManager() {
+#ifndef _WIN32
     for (const auto& kv : pool_) {
       FreeImpl(kv.second);
     }
+#endif
   }
 
   void Alloc(Storage::Handle* handle) override;
   void Free(Storage::Handle handle) override {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+#ifndef _WIN32
+      std::lock_guard<std::recursive_mutex> lock(mutex_);
       pool_.erase(handle.dptr);
+#endif
     }
     FreeImpl(handle);
   }
@@ -97,12 +101,11 @@ class CPUSharedStorageManager final : public StorageManager {
  private:
   static constexpr size_t alignment_ = 16;
 
-  std::mutex mutex_;
+  std::recursive_mutex mutex_;
   std::mt19937 rand_gen_;
   std::unordered_map<void*, Storage::Handle> pool_;
 #ifdef _WIN32
-  std::list<Storage::Handle> wait_real_free_;
-  std::mutex mutex_real_free_;
+  std::unordered_map<void*, HANDLE> map_handle_map_;
 #endif
 
   void FreeImpl(const Storage::Handle& handle);
@@ -120,7 +123,7 @@ class CPUSharedStorageManager final : public StorageManager {
 };  // class CPUSharedStorageManager
 
 void CPUSharedStorageManager::Alloc(Storage::Handle* handle) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   std::uniform_int_distribution<> dis(0, std::numeric_limits<int>::max());
 
   bool is_new = false;
@@ -154,11 +157,12 @@ void CPUSharedStorageManager::Alloc(Storage::Handle* handle) {
     LOG(FATAL) << "Failed to open shared memory. CreateFileMapping failed with error "
       << error;
   }
-  handle->map_handle = map_handle;
+
 
   void* ptr = MapViewOfFile(map_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
   CHECK_NE(ptr, (void*)0)
     << "Failed to map shared memory. MapViewOfFile failed with error " << GetLastError();
+  map_handle_map_[ptr] = map_handle;
 #else
   int fid = -1;
   if (handle->shared_id == -1 && handle->shared_pid == -1) {
@@ -198,10 +202,6 @@ void CPUSharedStorageManager::FreeImpl(const Storage::Handle& handle) {
   int count = DecrementRefCount(handle);
   CHECK_GE(count, 0);
 #ifdef _WIN32
-  {
-    std::lock_guard<std::mutex> lock(mutex_real_free_);
-    wait_real_free_.push_back(handle);
-  }
   CheckAndRealFree();
 #else
   CHECK_EQ(munmap(static_cast<char*>(handle.dptr) - alignment_,
@@ -221,21 +221,26 @@ void CPUSharedStorageManager::FreeImpl(const Storage::Handle& handle) {
 #ifdef _WIN32
 inline void CPUSharedStorageManager::CheckAndRealFree()
 {
-  std::lock_guard<std::mutex> lock(mutex_real_free_);
-  wait_real_free_.remove_if([](Storage::Handle& element) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  for (auto it = std::begin(pool_); it != std::end(pool_);)
+  {
+    void* ptr = static_cast<char*>(it->second.dptr) - alignment_;
     std::atomic<int>* counter = reinterpret_cast<std::atomic<int>*>(
-      static_cast<char*>(element.dptr) - alignment_);
+      static_cast<char*>(it->second.dptr) - alignment_);
     if ((*counter) == 0)
     {
-      CHECK_NE(UnmapViewOfFile(element.dptr), 0)
+      CHECK_NE(UnmapViewOfFile(ptr), 0)
         << "Failed to UnmapViewOfFile shared memory ";
-      CHECK_NE(CloseHandle(element.map_handle), 0)
+      CHECK_NE(CloseHandle(map_handle_map_[ptr]), 0)
         << "Failed to CloseHandle shared memory ";
-      element.map_handle = nullptr;
-      return true;
+      map_handle_map_.erase(ptr);
+      it = pool_.erase(it);
     }
-    return false;
-  });
+    else
+    {
+      ++it;
+    }
+  }
 }
 #endif // _WIN32
 

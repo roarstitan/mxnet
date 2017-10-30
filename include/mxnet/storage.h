@@ -55,9 +55,6 @@ class Storage {
      */
     int shared_pid{-1};
     int shared_id{-1};
-#ifdef _WIN32
-    void* map_handle{nullptr};
-#endif
   };
   /*!
    * \brief Allocate a new contiguous memory for a given size.
